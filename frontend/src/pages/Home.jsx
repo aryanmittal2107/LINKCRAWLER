@@ -25,7 +25,9 @@ export default function Home({ user, setUser }) {
   // predefined categories requested by the user
   const predefinedCategories = ["Movie", "Videos", "Images", "YouTube", "Sports"];
 
-  // small heuristic detector (used to populate missing categories client-side only)
+  // ---------------------------
+  // helpers: detect & normalize
+  // ---------------------------
   function detectCategoryFromURL(url = "", title = "") {
     const u = (url || "").toLowerCase();
     const t = (title || "").toLowerCase();
@@ -37,6 +39,24 @@ export default function Home({ user, setUser }) {
     if (u.includes("imdb") || u.includes("netflix") || check("movie") || check("film")) return "Movie";
     if (check("espn") || check("cric") || check("cricket") || check("sport") || check("football") || check("soccer")) return "Sports";
     return "";
+  }
+
+  // Session storage helpers to persist client-chosen categories
+  function persistCategoryToSession(linkId, categoryLabel) {
+    if (!linkId) return;
+    try {
+      if (categoryLabel) sessionStorage.setItem(`link_category_${linkId}`, categoryLabel);
+      else sessionStorage.removeItem(`link_category_${linkId}`);
+    } catch (e) { /* ignore storage errors */ }
+  }
+
+  function getPersistedCategory(linkId) {
+    if (!linkId) return "";
+    try {
+      return sessionStorage.getItem(`link_category_${linkId}`) || "";
+    } catch (e) {
+      return "";
+    }
   }
 
   // derive categories (tags + predefined) from links
@@ -66,6 +86,9 @@ export default function Home({ user, setUser }) {
     return Array.from(map.entries()).map(([key, label]) => ({ key, label })).sort((a, b) => a.label.localeCompare(b.label));
   }, [links]);
 
+  // ---------------------------
+  // load links (normalize & restore persisted categories)
+  // ---------------------------
   useEffect(() => {
     async function load() {
       setLoading(true);
@@ -73,14 +96,29 @@ export default function Home({ user, setUser }) {
         const res = await fetchLinks();
         const list = Array.isArray(res) ? res : (res && res.links) ? res.links : [];
 
-        // CLIENT-SIDE: fill missing category for existing links using detector
         const normalized = list.map((l) => {
           const copy = { ...l };
-          if (!copy.category || !String(copy.category).trim()) {
+
+          // server category if present
+          const serverCat = copy.category && String(copy.category).trim() ? String(copy.category).trim() : "";
+
+          // restore persisted category when server omitted it
+          const persisted = !serverCat ? getPersistedCategory(copy._id || copy.id) : "";
+
+          // final category: server > persisted > detect
+          let finalCat = serverCat || persisted;
+          if (!finalCat) {
             const detected = detectCategoryFromURL(copy.url, copy.title);
-            if (detected) copy.category = detected; // client-side only
-            else copy.category = ""; // keep consistent type
+            finalCat = detected || "";
           }
+
+          copy.category = finalCat ? finalCat : "";
+          copy._categoryKey = copy.category ? copy.category.trim().toLowerCase() : "";
+
+          // normalize tags to keys
+          if (Array.isArray(copy.tags)) copy._tagKeys = copy.tags.map(t => String(t || "").trim().toLowerCase()).filter(Boolean);
+          else copy._tagKeys = [];
+
           return copy;
         });
 
@@ -95,19 +133,21 @@ export default function Home({ user, setUser }) {
     load();
   }, []);
 
+  // ---------------------------
+  // search / filter
+  // ---------------------------
   function handleSearchSubmit(e) {
     e && e.preventDefault();
     const q = (query || "").trim().toLowerCase();
 
-    // start from all links
     let out = links;
 
     // CATEGORY FILTER — strict: match only saved category or tags (case-insensitive)
     if (selectedCategory) {
       const sel = String(selectedCategory).toLowerCase();
       out = out.filter((l) => {
-        const linkCategory = (l.category || "").toString().trim().toLowerCase();
-        const tags = Array.isArray(l.tags) ? l.tags.map(String).map((x) => x.trim().toLowerCase()) : [];
+        const linkCategory = (l._categoryKey || "").toString().trim().toLowerCase();
+        const tags = Array.isArray(l._tagKeys) ? l._tagKeys : [];
         return (linkCategory && linkCategory === sel) || tags.some((t) => t === sel);
       });
     }
@@ -139,6 +179,7 @@ export default function Home({ user, setUser }) {
     setNewNotes("");
     setNewCategory("");
     setShowModal(true);
+    // prevent background scroll while modal is open
     document.body.style.overflow = "hidden";
   }
   function closeModal() {
@@ -147,12 +188,19 @@ export default function Home({ user, setUser }) {
     document.body.style.overflow = "";
   }
 
-  // detect for save (same heuristics)
+  // auto-detect category from URL using simple heuristics (used when saving new links)
   function detectCategoryFromURLOnSave(url) {
-    return detectCategoryFromURL(url, "");
+    if (!url) return "";
+    const u = String(url).toLowerCase();
+    if (u.includes("youtube.com") || u.includes("youtu.be")) return "YouTube";
+    if (u.match(/\.(jpg|jpeg|png|gif|bmp|svg)$/) || u.includes("unsplash") || u.includes("pexels") || u.includes("pixabay")) return "Images";
+    if (u.includes("video") || u.match(/\.(mp4|mov|webm)$/)) return "Videos";
+    if (u.includes("imdb") || u.includes("netflix") || u.includes("movie") || u.includes("film")) return "Movie";
+    if (u.includes("espn") || u.includes("cric") || u.includes("cricket") || u.includes("sport") || u.includes("football") || u.includes("soccer")) return "Sports";
+    return "";
   }
 
-  // save new link — always ensure the payload/category is the display label
+  // save new link (async because createLink returns a promise)
   async function handleSaveLink(e) {
     e && e.preventDefault();
     setError(null);
@@ -168,13 +216,13 @@ export default function Home({ user, setUser }) {
         notes: newNotes,
       };
 
-      // Decide finalCategory (display label)
+      // prefer user-chosen category, otherwise try to detect from the URL
       const auto = detectCategoryFromURLOnSave(newUrl);
+
       let finalCategory = "";
       if (newCategory && String(newCategory).trim()) {
-        const lowered = String(newCategory).toLowerCase();
-        const found = categories.find((c) => c.key === lowered);
-        if (found) finalCategory = found.label;
+        const match = categories.find((c) => c.key === String(newCategory).toLowerCase());
+        if (match) finalCategory = match.label;
         else {
           const raw = String(newCategory).trim();
           finalCategory = raw.charAt(0).toUpperCase() + raw.slice(1);
@@ -188,14 +236,25 @@ export default function Home({ user, setUser }) {
       const saved = await createLink(payload);
       const savedLink = saved && saved.link ? saved.link : saved;
 
-      // ensure the client-side saved object always has the category (display label)
+      // ensure the client-side link object always contains the category
       if (!savedLink.category && payload.category) {
         savedLink.category = payload.category;
-      } else if (savedLink.category) {
+      }
+      if (savedLink && savedLink.category) {
         savedLink.category = String(savedLink.category).trim();
       } else {
         savedLink.category = "";
       }
+
+      // persist the category in session storage so it survives re-fetch when server might omit it
+      if (savedLink && (savedLink._id || savedLink.id) && savedLink.category) {
+        persistCategoryToSession(savedLink._id || savedLink.id, savedLink.category);
+      }
+
+      // normalize fields on savedLink before adding to UI
+      savedLink._categoryKey = savedLink.category ? savedLink.category.trim().toLowerCase() : "";
+      if (Array.isArray(savedLink.tags)) savedLink._tagKeys = savedLink.tags.map(t => String(t || "").trim().toLowerCase()).filter(Boolean);
+      else savedLink._tagKeys = [];
 
       const updated = [savedLink, ...links];
       setLinks(updated);
@@ -216,6 +275,9 @@ export default function Home({ user, setUser }) {
       await deleteLink(id);
       setLinks((prev) => prev.filter((l) => String(l._id || l.id) !== String(id)));
       setFiltered((prev) => prev.filter((l) => String(l._id || l.id) !== String(id)));
+
+      // clear persisted category for deleted link
+      persistCategoryToSession(id, "");
     } catch (err) {
       console.error("Failed to delete link:", err);
       const msg = err && (err.body?.message || err.message || String(err));
@@ -225,11 +287,10 @@ export default function Home({ user, setUser }) {
     }
   }
 
-  // small style helpers (unchanged except added sizes for centered header)
+  // small style helpers to keep JSX tidy (unchanged visually)
   const styles = {
     pageBg: { background: "linear-gradient(180deg, #f6b600 0%, #f0a800 100%)", minHeight: "100vh" },
     container: { maxWidth: 1100, margin: "0 auto", padding: "22px 18px" },
-    // searchBar: keep visually the same, but we'll constrain width so it's centered below logo
     searchBar: { display: "flex", gap: 12, alignItems: "center", padding: 14, background: "#fff", borderRadius: 999, boxShadow: "0 12px 30px rgba(0,0,0,0.12)", width: "100%" },
     searchFormWrapper: { display: "flex", justifyContent: "center", width: "100%" }, // centers the search form
     searchFormInner: { width: "min(820px, 100%)" }, // control the width of the pill search bar
